@@ -6,7 +6,7 @@ import mimetypes
 from typing import Annotated, AsyncGenerator, AsyncIterable, Literal
 
 import orjson
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from app.control.account.state_machine import is_manageable
@@ -23,6 +23,7 @@ from .schemas import (
     VideoConfig,
     ImageConfig,
     ResponsesCreateRequest,
+    VideoCreateJSONRequest,
 )
 from .chat import completions as chat_completions
 
@@ -462,12 +463,13 @@ async def image_generations(req: ImageGenerationRequest):
 
 @router.post("/videos", tags=[_TAG_VIDEOS], dependencies=[Depends(verify_api_key)])
 async def videos_create(
-    model: Annotated[str, Form(...)],
-    prompt: Annotated[str, Form(...)],
+    request: Request,
+    model: Annotated[str | None, Form()] = None,
+    prompt: Annotated[str | None, Form()] = None,
     seconds: Annotated[int, Form()] = 6,
     size: Annotated[
-        Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"], Form()
-    ] = "720x1280",
+        Literal["720x1280", "1280x720", "1024x1024", "1024x1792", "1792x1024"] | None, Form()
+    ] = None,
     resolution_name: Annotated[Literal["480p", "720p"] | None, Form()] = None,
     preset: Annotated[
         Literal["fun", "normal", "spicy", "custom"] | None, Form()
@@ -478,23 +480,51 @@ async def videos_create(
 ):
     from .video import create_video
 
-    references_payload = None
-    if input_reference:
-        references_payload = [
-            {"image_url": await _upload_to_data_uri(f, param="input_reference")}
-            for f in input_reference[:7]
-        ]
+    # Detect JSON body via Content-Type, parse manually
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        json_req = VideoCreateJSONRequest(**body)
+        model = json_req.model
+        prompt = json_req.prompt
+        seconds = json_req.seconds or 6
+        size = json_req.size or "720x1280"
+        resolution_name = json_req.resolution_name
+        preset = json_req.preset
+        references_payload = (
+            [{"image_url": url} for url in json_req.images[:7]]
+            if json_req.images else None
+        )
+    else:
+        size = size or "720x1280"
+        references_payload = None
+        if input_reference:
+            references_payload = [
+                {"image_url": await _upload_to_data_uri(f, param="input_reference")}
+                for f in input_reference[:7]
+            ]
 
     result = await create_video(
         model=model or "grok-video",
         prompt=prompt,
         seconds=seconds,
-        size=size or "720x1280",
+        size=size,
         resolution_name=resolution_name,
         preset=preset,
         input_references=references_payload,
     )
     return JSONResponse(result)
+
+
+@router.get(
+    "/videos/{video_id}.mp4",
+    tags=[_TAG_VIDEOS],
+)
+async def videos_download(video_id: str):
+    from .video import content_path
+
+    path = await content_path(video_id)
+    return FileResponse(path, media_type="video/mp4", filename=f"{video_id}.mp4")
 
 
 @router.get(
@@ -509,7 +539,6 @@ async def videos_retrieve(video_id: str):
 @router.get(
     "/videos/{video_id}/content",
     tags=[_TAG_VIDEOS],
-    dependencies=[Depends(verify_api_key)],
 )
 async def videos_content(video_id: str):
     from .video import content_path

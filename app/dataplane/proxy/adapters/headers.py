@@ -272,7 +272,8 @@ def build_http_headers(
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": site,
         "User-Agent": ua,
-        "x-statsig-id": _statsig_id(),
+        # "x-statsig-id": _statsig_id(),
+        "x-statsig-id": "MxMz1HKSk8j1gXnmE8+okZZNYe+t6UsuQNyfuSkGP4OhxaVUJ9yeNpucnUNKanerC0Al2Tbsptc4282kojCvh/05vfl8MA",
         "x-xai-request-id": str(uuid.uuid4()),
     }
     headers.update(_client_hints(browser, raw_ua))

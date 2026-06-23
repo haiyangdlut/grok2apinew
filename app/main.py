@@ -15,6 +15,7 @@ import asyncio
 import os
 import platform
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -347,7 +348,14 @@ def create_app() -> FastAPI:
 
         await _config.load()
         reconcile_refresh_runtime()
-        return await call_next(request)
+        start = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "{} {} → {} ({:.0f}ms)",
+            request.method, request.url.path, response.status_code, elapsed_ms,
+        )
+        return response
 
     # Global exception handler — converts AppError to JSON.
     @app.exception_handler(AppError)

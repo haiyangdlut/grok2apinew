@@ -49,6 +49,16 @@ class ImageGenerationRequest(BaseModel):
     response_format: str | None = "url"
 
 
+class VideoCreateJSONRequest(BaseModel):
+    model:           str
+    prompt:          str
+    seconds:         int | None = 6
+    size:            str | None = "720x1280"
+    resolution_name: str | None = None
+    preset:          str | None = None
+    images:          list[str] | None = None
+
+
 class ImageEditRequest(BaseModel):
     model:           str
     prompt:          str

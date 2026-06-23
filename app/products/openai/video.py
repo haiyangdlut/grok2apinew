@@ -28,6 +28,7 @@ from app.platform.errors import (
 from app.platform.logging.logger import logger
 from app.platform.runtime.clock import now_s
 from app.platform.storage import save_local_video
+from app.platform.storage.video_job_store import VideoJobStore
 from app.control.account.enums import FeedbackKind
 from app.control.model import registry as model_registry
 from app.control.model.registry import resolve as resolve_model
@@ -120,10 +121,11 @@ class _VideoJob:
             "prompt": self.prompt,
             "seconds": self.seconds,
             "size": self.size,
-            "quality": self.quality,
         }
         if self.completed_at is not None:
             payload["completed_at"] = self.completed_at
+        if self.status == "completed" and self.content_path:
+            payload["url"] = _build_download_url(self.id)
         if self.error is not None:
             payload["error"] = self.error
         if self.remixed_from_video_id:
@@ -131,8 +133,70 @@ class _VideoJob:
         return payload
 
 
-_VIDEO_JOBS: dict[str, _VideoJob] = {}
-_VIDEO_JOBS_LOCK = asyncio.Lock()
+_video_store: "VideoJobStore | None" = None
+_store_lock = asyncio.Lock()
+
+
+async def _get_store() -> "VideoJobStore":
+    global _video_store
+    if _video_store is not None:
+        return _video_store
+    async with _store_lock:
+        if _video_store is not None:
+            return _video_store
+        import os
+        from sqlalchemy.ext.asyncio import create_async_engine
+        db_url = os.getenv("VIDEO_DB_URL", "").strip()
+        if not db_url:
+            db_url = get_config().get_str("storage.video_db_url", "")
+        if not db_url:
+            raise RuntimeError("VIDEO_DB_URL not configured")
+        if db_url.startswith("mysql://"):
+            db_url = "mysql+aiomysql://" + db_url[len("mysql://"):]
+        engine = create_async_engine(db_url, pool_size=5, max_overflow=10, pool_pre_ping=True)
+        _video_store = VideoJobStore(engine)
+        await _video_store.ensure_table()
+        logger.info("video job store initialised")
+        return _video_store
+
+
+def _job_to_store_row(job: _VideoJob) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "created_at": job.created_at,
+        "status": job.status,
+        "model": job.model,
+        "progress": job.progress,
+        "prompt": job.prompt,
+        "seconds": job.seconds,
+        "size": job.size,
+        "quality": job.quality,
+        "completed_at": job.completed_at,
+        "content_path": job.content_path,
+        "video_url": job.video_url,
+        "error": job.error,
+        "remixed_from_video_id": job.remixed_from_video_id,
+        "updated_at": int(time.time()),
+    }
+
+
+def _row_to_job(row: dict[str, Any]) -> _VideoJob:
+    return _VideoJob(
+        id=row["id"],
+        model=row["model"],
+        prompt=row["prompt"],
+        seconds=row["seconds"],
+        size=row["size"],
+        quality=row["quality"],
+        created_at=row["created_at"],
+        status=row["status"],
+        progress=row["progress"],
+        completed_at=row.get("completed_at"),
+        error=row.get("error"),
+        remixed_from_video_id=row.get("remixed_from_video_id"),
+        video_url=row.get("video_url", ""),
+        content_path=row.get("content_path", ""),
+    )
 
 
 def _build_message(prompt: str, preset: str) -> str:
@@ -345,7 +409,13 @@ async def _stream_video_request(
             stream=True,
         )
         if response.status_code != 200:
-            body = response.content.decode("utf-8", "replace")[:300]
+            try:
+                body_bytes = await response.aread()
+                body = body_bytes.decode("utf-8", "replace")[:500]
+            except Exception:
+                body = "<unable to read body>"
+            logger.error("video upstream {} body: {}", response.status_code, body or "<empty>")
+            logger.error("video request headers: {}", {k: v[:80] if isinstance(v, str) and len(v) > 80 else v for k, v in headers.items()})
             raise UpstreamError(
                 f"Video upstream returned {response.status_code}",
                 status=response.status_code,
@@ -593,6 +663,15 @@ def _local_video_url(file_id: str) -> str:
     )
 
 
+def _build_download_url(video_id: str) -> str:
+    app_url = get_config().get_str("app.app_url", "").rstrip("/")
+    return (
+        f"{app_url}/v1/videos/{video_id}.mp4"
+        if app_url
+        else f"/v1/videos/{video_id}.mp4"
+    )
+
+
 def _normalize_video_format(value: str | None) -> str:
     fmt = (value or "grok_url").strip().lower()
     if fmt not in {"grok_url", "local_url", "grok_html", "local_html"}:
@@ -794,28 +873,35 @@ async def _run_video_with_account(
 
 
 async def _put_video_job(job: _VideoJob) -> None:
-    async with _VIDEO_JOBS_LOCK:
-        _VIDEO_JOBS[job.id] = job
+    store = await _get_store()
+    await store.insert_job(_job_to_store_row(job))
 
 
 async def get_video_job(video_id: str) -> _VideoJob | None:
-    async with _VIDEO_JOBS_LOCK:
-        return _VIDEO_JOBS.get(video_id)
+    store = await _get_store()
+    row = await store.get_job(video_id)
+    if row is None:
+        return None
+    return _row_to_job(row)
 
 
 async def _expire_video_job(video_id: str, ttl_s: int = _VIDEO_JOB_TTL_S) -> None:
     await asyncio.sleep(ttl_s)
-    async with _VIDEO_JOBS_LOCK:
-        _VIDEO_JOBS.pop(video_id, None)
+    store = await _get_store()
+    await store.delete_job(video_id)
 
 
 async def _set_job_status(
     job: _VideoJob, *, status: str, progress: int | None = None
 ) -> None:
-    async with _VIDEO_JOBS_LOCK:
-        job.status = status
-        if progress is not None:
-            job.progress = max(0, min(100, progress))
+    job.status = status
+    if progress is not None:
+        job.progress = max(0, min(100, progress))
+        # Log progress milestones and final status
+        if job.progress in {10, 25, 50, 75, 90, 100} or status in {"completed", "failed"}:
+            logger.info("video progress: id={} status={} progress={}%", job.id, status, job.progress)
+    store = await _get_store()
+    await store.update_job(_job_to_store_row(job))
 
 
 def _job_error_payload(message: str) -> dict[str, Any]:
@@ -833,6 +919,7 @@ async def _run_video_job(
     input_references: list[dict[str, Any]] | None = None,
 ) -> None:
     try:
+        logger.info("video generation start: id={} model={} seconds={} size={}", job.id, job.model, seconds, size)
         await _set_job_status(job, status="in_progress", progress=1)
         aspect_ratio, default_resolution_name = _resolve_video_size(size)
         resolved_resolution_name = _resolve_video_resolution_name(
@@ -899,18 +986,26 @@ async def _run_video_job(
                 asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
 
         path = _save_video_bytes(raw, job.id)
-        async with _VIDEO_JOBS_LOCK:
-            job.status = "completed"
-            job.progress = 100
-            job.completed_at = int(time.time())
-            job.video_url = artifact.video_url
-            job.content_path = str(path)
-            job.remixed_from_video_id = artifact.remixed_from_video_id
+        job.status = "completed"
+        job.progress = 100
+        job.completed_at = int(time.time())
+        job.video_url = artifact.video_url
+        job.content_path = str(path)
+        job.remixed_from_video_id = artifact.remixed_from_video_id
+        store = await _get_store()
+        await store.update_job(_job_to_store_row(job))
+        file_size_mb = path.stat().st_size / (1024 * 1024)
+        elapsed_s = job.completed_at - job.created_at
+        logger.info(
+            "video generation done: id={} duration={}s file={:.1f}MB",
+            job.id, elapsed_s, file_size_mb,
+        )
     except Exception as exc:
         logger.exception("video job failed: job_id={} error={}", job.id, exc)
-        async with _VIDEO_JOBS_LOCK:
-            job.status = "failed"
-            job.error = _job_error_payload(_exception_message(exc))
+        job.status = "failed"
+        job.error = _job_error_payload(_exception_message(exc))
+        store = await _get_store()
+        await store.update_job(_job_to_store_row(job))
 
 
 async def create_video(
@@ -948,6 +1043,7 @@ async def create_video(
         created_at=int(time.time()),
     )
     await _put_video_job(job)
+    logger.info("video job created: id={} model={} seconds={} size={}", job.id, model, normalized_seconds, normalized_size)
     asyncio.create_task(
         _run_video_job(
             job,

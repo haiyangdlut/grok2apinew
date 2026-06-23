@@ -245,6 +245,11 @@ async def lifespan(app: FastAPI):
         proxy_scheduler.start()
 
     logger.info("application startup completed")
+
+    # Recover video jobs left in "in_progress" from a prior restart.
+    from app.products.openai.video import recover_in_progress_video_jobs
+    asyncio.create_task(recover_in_progress_video_jobs())
+
     yield
 
     # -----------

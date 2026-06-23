@@ -5,6 +5,7 @@ Uses the project's existing SQLAlchemy + aiomysql infrastructure.
 """
 
 import json
+import time
 from typing import Any
 
 import sqlalchemy as sa
@@ -127,6 +128,25 @@ class VideoJobStore:
             await conn.execute(
                 video_jobs_table.delete().where(video_jobs_table.c.id == video_id)
             )
+
+    async def find_stuck_in_progress_jobs(
+        self, cutoff_unix: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return in_progress jobs created after *cutoff_unix* (default: now - 3600)."""
+        await self.ensure_table()
+        if cutoff_unix is None:
+            cutoff_unix = int(time.time()) - 3600
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                sa.select(video_jobs_table).where(
+                    sa.and_(
+                        video_jobs_table.c.status == "in_progress",
+                        video_jobs_table.c.created_at >= cutoff_unix,
+                    )
+                )
+            )
+            rows = result.fetchall()
+            return [_row_to_job(row) for row in rows]
 
     async def close(self) -> None:
         await self._engine.dispose()

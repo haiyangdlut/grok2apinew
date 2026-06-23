@@ -46,18 +46,25 @@ from app.dataplane.reverse.transport.asset_upload import (
     upload_from_input,
 )
 from app.dataplane.reverse.transport.assets import download_asset
-from app.dataplane.reverse.transport.media import create_media_post
+from app.dataplane.reverse.transport.media import create_media_post, upscale_video
 from ._format import (
     make_chat_response,
     make_response_id,
     make_stream_chunk,
     make_thinking_chunk,
 )
-from .chat import _fail_sync, _quota_sync, _feedback_kind
+from .chat import (
+    _configured_retry_codes,
+    _fail_sync,
+    _feedback_kind,
+    _quota_sync,
+    _should_retry_upstream,
+)
+from app.products._account_selection import reserve_account, selection_max_retries
 
 _IMAGE_MEDIA_TYPE = "MEDIA_POST_TYPE_IMAGE"
 _VIDEO_MEDIA_TYPE = "MEDIA_POST_TYPE_VIDEO"
-_VIDEO_MODEL_NAME = "imagine-video-gen"
+_VIDEO_MODEL_NAME = "grok-imagine-video-1.5-preview"
 _VIDEO_QUALITY = "standard"
 _VIDEO_OBJECT = "video"
 _VIDEO_JOB_TTL_S = 3600
@@ -84,6 +91,7 @@ class _VideoArtifact:
     video_post_id: str
     asset_id: str
     thumbnail_url: str
+    resolution_name: str = ""
     remixed_from_video_id: str | None = None
 
 
@@ -116,7 +124,7 @@ class _VideoJob:
             "object": _VIDEO_OBJECT,
             "created_at": self.created_at,
             "status": self.status,
-            "model": self.model,
+            "model": _VIDEO_MODEL_NAME,
             "progress": self.progress,
             "prompt": self.prompt,
             "seconds": self.seconds,
@@ -158,6 +166,40 @@ async def _get_store() -> "VideoJobStore":
         await _video_store.ensure_table()
         logger.info("video job store initialised")
         return _video_store
+
+
+async def recover_in_progress_video_jobs() -> int:
+    """Re-run video jobs that were left in 'in_progress' after a restart.
+
+    Only jobs created within the last hour are recovered to avoid re-running
+    old abandoned jobs. Returns the count of recovered jobs.
+    """
+    store = await _get_store()
+    cutoff = int(time.time()) - _VIDEO_JOB_TTL_S
+    stuck = await store.find_stuck_in_progress_jobs(cutoff_unix=cutoff)
+    if not stuck:
+        return 0
+    logger.info(
+        "video job recovery: found {} stuck in_progress job(s)",
+        len(stuck),
+    )
+    for row in stuck:
+        job = _row_to_job(row)
+        logger.info(
+            "video job recovery: re-running id={} model={} prompt={:.80s}",
+            job.id, job.model, job.prompt,
+        )
+        asyncio.create_task(
+            _run_video_job(
+                job,
+                size=job.size,
+                resolution_name=None,
+                prompt=job.prompt,
+                seconds=int(job.seconds),
+                preset=None,
+            )
+        )
+    return len(stuck)
 
 
 def _job_to_store_row(job: _VideoJob) -> dict[str, Any]:
@@ -297,8 +339,14 @@ def _video_create_payload(
     return {
         "temporary": True,
         "modelName": _VIDEO_MODEL_NAME,
+        "modelMode": "IMAGINE",
         "message": _build_message(prompt, preset),
+        "enableImageGeneration": True,
         "enableSideBySide": True,
+        "imageGenerationCount": 2,
+        "toolOverrides": {"videoGen": True},
+        "returnRawGrokInXaiRequest": False,
+        "sendFinalMetadata": True,
         "responseMetadata": {
             "experiments": [],
             "modelConfigOverride": {
@@ -328,8 +376,14 @@ def _video_extend_payload(
     return {
         "temporary": True,
         "modelName": _VIDEO_MODEL_NAME,
+        "modelMode": "IMAGINE",
         "message": _build_message(prompt, preset),
+        "enableImageGeneration": True,
         "enableSideBySide": True,
+        "imageGenerationCount": 2,
+        "toolOverrides": {"videoGen": True},
+        "returnRawGrokInXaiRequest": False,
+        "sendFinalMetadata": True,
         "responseMetadata": {
             "experiments": [],
             "modelConfigOverride": {
@@ -414,8 +468,7 @@ async def _stream_video_request(
                 body = body_bytes.decode("utf-8", "replace")[:500]
             except Exception:
                 body = "<unable to read body>"
-            logger.error("video upstream {} body: {}", response.status_code, body or "<empty>")
-            logger.error("video request headers: {}", {k: v[:80] if isinstance(v, str) and len(v) > 80 else v for k, v in headers.items()})
+            logger.error("video upstream {}", response.status_code)
             raise UpstreamError(
                 f"Video upstream returned {response.status_code}",
                 status=response.status_code,
@@ -559,6 +612,7 @@ async def _collect_video_segment(
     final_asset_id = ""
     final_thumbnail = ""
     video_post_id = ""
+    resolution_name = ""
     stream_data_items: list[str] = []
 
     async for line in _stream_video_request(
@@ -595,6 +649,10 @@ async def _collect_video_segment(
                 or ""
             ).strip()
 
+            res = stream.get("resolutionName")
+            if isinstance(res, str) and res:
+                resolution_name = res
+
             if progress >= 100 and not stream.get("moderated"):
                 raw_url = stream.get("videoUrl")
                 asset_id = stream.get("assetId")
@@ -616,11 +674,13 @@ async def _collect_video_segment(
     if not final_url and final_asset_id:
         raise UpstreamError(
             "Video segment returned only assetId without a resolvable URL",
+            status=503,
             body="\n".join(stream_data_items),
         )
     if not final_url:
         raise UpstreamError(
             "Video generation returned no final video URL",
+            status=503,
             body="\n".join(stream_data_items),
         )
 
@@ -629,6 +689,7 @@ async def _collect_video_segment(
         video_post_id=video_post_id or final_asset_id,
         asset_id=final_asset_id,
         thumbnail_url=final_thumbnail,
+        resolution_name=resolution_name,
     )
 
 
@@ -652,6 +713,37 @@ async def _download_video_bytes(token: str, url: str) -> tuple[bytes, str]:
 
 def _save_video_bytes(raw: bytes, file_id: str) -> Path:
     return save_local_video(raw, file_id)
+
+
+async def _upscale_video_hd(token: str, artifact: _VideoArtifact) -> str | None:
+    """Try to upscale video via Grok's /rest/media/video/upscale endpoint.
+
+    Returns the HD video URL on success, or None if upscale is not possible.
+    """
+    import re
+    video_id = ""
+    if artifact.video_url:
+        m = re.search(r"/generated/([0-9a-fA-F-]{32,36})/", artifact.video_url)
+        if m:
+            video_id = m.group(1)
+    if not video_id:
+        if artifact.video_post_id or artifact.asset_id:
+            logger.debug(
+                "video upscale: no /generated/ uuid in video_url={}, "
+                "trying videoPostId={}",
+                artifact.video_url[:120] if artifact.video_url else "",
+                artifact.video_post_id,
+            )
+        return None
+    try:
+        result = await upscale_video(token, video_id)
+        hd_url = result.get("hdMediaUrl") if isinstance(result, dict) else None
+        if isinstance(hd_url, str) and hd_url:
+            return hd_url
+        logger.warning("video upscale returned no hdMediaUrl: result={}", str(result)[:200])
+    except Exception as exc:
+        logger.warning("video upscale failed for video_id={}: {}", video_id, exc)
+    return None
 
 
 def _local_video_url(file_id: str) -> str:
@@ -721,9 +813,12 @@ async def _generate_video_with_token(
 ) -> _VideoArtifact:
     references: list[_VideoReference] = []
     if input_references:
+        logger.info("video generate: has {} input reference(s)", len(input_references))
         references = await _prepare_video_references(token, input_references)
         parent_post_id = references[0].post_id
+        logger.info("video generate: parent_post_id={}", parent_post_id)
     else:
+        logger.info("video generate: text-to-video mode (no input references)")
         post = await create_media_post(
             token,
             media_type=_VIDEO_MEDIA_TYPE,
@@ -736,6 +831,7 @@ async def _generate_video_with_token(
         parent_post_id = str(post_data.get("id") or "").strip()
         if not parent_post_id:
             raise UpstreamError("Video create-post returned no post id")
+        logger.info("video generate: parent_post_id={}", parent_post_id)
 
     segments = _build_segment_lengths(seconds)
     total_segments = len(segments)
@@ -743,6 +839,10 @@ async def _generate_video_with_token(
     extend_post_id = parent_post_id
     elapsed_seconds = 0
 
+    logger.info(
+        "video generate: segments={} total={}s aspect={} resolution={}",
+        segments, seconds, aspect_ratio, resolution_name,
+    )
     for index, segment_length in enumerate(segments):
         if index == 0:
             payload = _video_create_payload(
@@ -784,6 +884,11 @@ async def _generate_video_with_token(
             referer=referer,
             timeout_s=timeout_s,
             progress_cb=_segment_progress if progress_cb is not None else None,
+        )
+        logger.info(
+            "video segment done: index={}/{} length={}s post_id={}",
+            index + 1, total_segments, segment_length,
+            artifact.video_post_id or artifact.asset_id,
         )
         if index == 0 and total_segments > 1:
             artifact.remixed_from_video_id = artifact.video_post_id or parent_post_id
@@ -933,57 +1038,107 @@ async def _run_video_job(
 
         if _acct_dir is None:
             raise RateLimitError("Account directory not initialised")
+        directory = _acct_dir
 
-        acct = await _acct_dir.reserve(
-            pool_candidates=spec.pool_candidates(),
-            mode_id=int(spec.mode_id),
-            now_s_override=now_s(),
-        )
-        if acct is None:
-            raise RateLimitError("No available accounts for video generation")
+        cfg = get_config()
+        max_retries = selection_max_retries()
+        retry_codes = _configured_retry_codes(cfg)
+        timeout_s = cfg.get_float("video.timeout", 180.0)
+        excluded: list[str] = []
 
-        token = acct.token
-        success = False
-        fail_exc: BaseException | None = None
-        try:
-            cfg = get_config()
-            timeout_s = cfg.get_float("video.timeout", 180.0)
+        # ── Retry loop: swap token on 429 / upstream errors ────────────
+        for attempt in range(max_retries + 1):
+            acct, selected_mode_id = await reserve_account(
+                directory,
+                spec,
+                now_s_override=now_s(),
+                exclude_tokens=excluded or None,
+            )
+            if acct is None:
+                raise RateLimitError("No available accounts for video generation")
 
-            async def _progress(progress: int) -> None:
-                await _set_job_status(
-                    job, status="in_progress", progress=max(1, progress)
+            token = acct.token
+            success = False
+            should_retry = False
+            fail_exc: BaseException | None = None
+            try:
+                async def _progress(progress: int) -> None:
+                    await _set_job_status(
+                        job, status="in_progress", progress=max(1, progress)
+                    )
+
+                artifact = await _generate_video_with_token(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    resolution_name=resolved_resolution_name,
+                    seconds=seconds,
+                    preset=resolved_preset,
+                    timeout_s=timeout_s,
+                    input_references=input_references,
+                    progress_cb=_progress,
                 )
+                raw, _mime = await _download_video_bytes(token, artifact.video_url)
 
-            artifact = await _generate_video_with_token(
-                token=token,
-                prompt=prompt,
-                aspect_ratio=aspect_ratio,
-                resolution_name=resolved_resolution_name,
-                seconds=seconds,
-                preset=resolved_preset,
-                timeout_s=timeout_s,
-                input_references=input_references,
-                progress_cb=_progress,
-            )
-            raw, _mime = await _download_video_bytes(token, artifact.video_url)
-            success = True
-        except BaseException as exc:
-            fail_exc = exc
-            raise
-        finally:
-            await _acct_dir.release(acct)
-            kind = (
-                FeedbackKind.SUCCESS
-                if success
-                else _feedback_kind(fail_exc)
-                if fail_exc
-                else FeedbackKind.SERVER_ERROR
-            )
-            await _acct_dir.feedback(token, kind, int(spec.mode_id))
+                # Only upscale if Grok returned below 720p (e.g. 480p).
+                # Upscale is best-effort — failure does not trigger a retry.
+                if resolved_resolution_name == "720p" and artifact.resolution_name != "720p":
+                    upscaled_url = await _upscale_video_hd(token, artifact)
+                    if upscaled_url:
+                        logger.info("video upscaled to HD: id={} actual_res={}", job.id, artifact.resolution_name)
+                        raw, _mime = await _download_video_bytes(token, upscaled_url)
+                    else:
+                        logger.warning("video upscale unavailable, keeping {}: id={}", artifact.resolution_name, job.id)
+                else:
+                    logger.info("video resolution ok ({}), skipping upscale: id={}", artifact.resolution_name or resolved_resolution_name, job.id)
+
+                success = True
+            except UpstreamError as exc:
+                fail_exc = exc
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                    should_retry = True
+                    excluded.append(token)
+                    logger.warning(
+                        "video retry: id={} attempt={}/{} token={} status={}",
+                        job.id, attempt + 1, max_retries + 1, token[-8:], exc.status,
+                    )
+                else:
+                    raise
+            except RateLimitError:
+                fail_exc = RateLimitError("All video accounts rate limited")
+                raise
+            except BaseException as exc:
+                fail_exc = exc
+                raise
+            finally:
+                await directory.release(acct)
+                kind = (
+                    FeedbackKind.SUCCESS
+                    if success
+                    else _feedback_kind(fail_exc)
+                    if fail_exc
+                    else FeedbackKind.SERVER_ERROR
+                )
+                await directory.feedback(token, kind, int(selected_mode_id))
+                if success:
+                    asyncio.create_task(_quota_sync(token, int(selected_mode_id)))
+                else:
+                    asyncio.create_task(_fail_sync(token, int(selected_mode_id), fail_exc))
+
             if success:
-                asyncio.create_task(_quota_sync(token, int(spec.mode_id)))
-            else:
-                asyncio.create_task(_fail_sync(token, int(spec.mode_id), fail_exc))
+                break
+
+            if not should_retry:
+                raise fail_exc  # type: ignore[misc]
+
+        else:
+            logger.error(
+                "video exhausted retries: id={} max_retries={}",
+                job.id, max_retries + 1,
+            )
+
+        if not success:
+            raise fail_exc  # type: ignore[misc]
 
         path = _save_video_bytes(raw, job.id)
         job.status = "completed"
@@ -1025,6 +1180,14 @@ async def create_video(
     cleaned_prompt = (prompt or "").strip()
     if not cleaned_prompt:
         raise ValidationError("prompt cannot be empty", param="prompt")
+
+    logger.info(
+        "video request: model={} seconds={} size={} resolution={} preset={} prompt={!r}",
+        model, seconds, size, resolution_name, preset, cleaned_prompt,
+    )
+    if input_references:
+        image_urls = [ref.get("url", ref.get("content_url", "?")) for ref in input_references]
+        logger.info("video request images: {}", image_urls)
 
     normalized_seconds = _coerce_seconds(seconds)
     validate_video_length(normalized_seconds)

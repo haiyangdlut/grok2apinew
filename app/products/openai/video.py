@@ -1023,6 +1023,7 @@ async def _run_video_job(
     preset: str | None,
     input_references: list[dict[str, Any]] | None = None,
 ) -> None:
+    _last_error: str = ""
     try:
         logger.info("video generation start: id={} model={} seconds={} size={}", job.id, job.model, seconds, size)
         await _set_job_status(job, status="in_progress", progress=1)
@@ -1095,6 +1096,7 @@ async def _run_video_job(
                 success = True
             except UpstreamError as exc:
                 fail_exc = exc
+                _last_error = _exception_message(exc)
                 if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
                     should_retry = True
                     excluded.append(token)
@@ -1109,6 +1111,7 @@ async def _run_video_job(
                 raise
             except BaseException as exc:
                 fail_exc = exc
+                _last_error = _exception_message(exc)
                 raise
             finally:
                 await directory.release(acct)
@@ -1152,13 +1155,18 @@ async def _run_video_job(
         file_size_mb = path.stat().st_size / (1024 * 1024)
         elapsed_s = job.completed_at - job.created_at
         logger.info(
-            "video generation done: id={} duration={}s file={:.1f}MB",
-            job.id, elapsed_s, file_size_mb,
+            "[VIDEO OK] id={} duration={}s size={:.1f}MB attempts={} resolution={}",
+            job.id, elapsed_s, file_size_mb, attempt + 1,
+            artifact.resolution_name or resolved_resolution_name,
         )
     except Exception as exc:
-        logger.exception("video job failed: job_id={} error={}", job.id, exc)
+        error_msg = _exception_message(exc)
+        logger.error(
+            "[VIDEO FAIL] id={} attempts={}/{} error='{}' last_try_error='{}'",
+            job.id, attempt + 1, max_retries + 1, error_msg, _last_error or error_msg,
+        )
         job.status = "failed"
-        job.error = _job_error_payload(_exception_message(exc))
+        job.error = _job_error_payload(error_msg)
         store = await _get_store()
         await store.update_job(_job_to_store_row(job))
 

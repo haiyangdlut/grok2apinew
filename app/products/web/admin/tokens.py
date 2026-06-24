@@ -80,6 +80,7 @@ class EditTokenRequest(BaseModel):
     old_token: str
     token: str
     pool: str = "basic"
+    remark: str = ""
 
 
 class ToggleTokenDisabledRequest(BaseModel):
@@ -95,6 +96,16 @@ class ToggleTokensDisabledRequest(BaseModel):
 class TokenImportItem(BaseModel):
     token: str
     tags: list[str] = []
+
+
+class TokenImportWithRemark(BaseModel):
+    token: str
+    remark: str = ""
+
+
+class BatchImportRequest(BaseModel):
+    tokens: list[TokenImportWithRemark]
+    pool: str = "super"
 
 
 class SaveTokensRequest(RootModel[dict[str, list[str | TokenImportItem]]]):
@@ -119,6 +130,7 @@ def _quota_brief(q: dict) -> dict:
 
 
 def _serialize_record(r) -> dict:
+    ext = r.ext or {}
     return {
         "token":       r.token,
         "pool":        r.pool or "basic",
@@ -127,6 +139,7 @@ def _serialize_record(r) -> dict:
         "use_count":   r.usage_use_count or 0,
         "last_used_at": r.last_use_at,
         "tags":        r.tags or [],
+        "remark":      ext.get("remark", ""),
     }
 
 
@@ -317,16 +330,23 @@ async def edit_token(
                 status=409,
             )
 
+    merged_ext = dict(record.ext)
+    remark = (req.remark or "").strip()
+    if remark:
+        merged_ext["remark"] = remark
+    else:
+        merged_ext.pop("remark", None)
+
     await repo.upsert_accounts([AccountUpsert(
         token=new_token,
         pool=pool,
         tags=record.tags,
-        ext=record.ext,
+        ext=merged_ext,
     )])
 
     if old_token == new_token:
-        logger.info("admin token updated: token={} pool={}", _mask(new_token), pool)
-        return _json({"status": "success", "token": new_token, "pool": pool})
+        logger.info("admin token updated: token={} pool={} remark={}", _mask(new_token), pool, remark)
+        return _json({"status": "success", "token": new_token, "pool": pool, "remark": remark})
 
     qs = record.quota_set()
     await repo.patch_accounts([AccountPatch(
@@ -471,6 +491,115 @@ async def replace_pool(
     if cleaned:
         asyncio.create_task(_refresh_imported(refresh_svc, cleaned))
     return _json({"pool": req.pool, "count": len(cleaned)})
+
+
+# ---------------------------------------------------------------------------
+# Fire-and-forget import refresh
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Batch import — supports remark
+# ---------------------------------------------------------------------------
+
+@router.post("/tokens/import")
+async def import_tokens_with_remark(
+    req: BatchImportRequest,
+    repo: "AccountRepository" = Depends(get_repo),
+    refresh_svc: "AccountRefreshService" = Depends(get_refresh_svc),
+):
+    """Batch import tokens with optional remark per token.
+
+    Payload:
+        {
+            "tokens": [
+                {"token": "<jwt>", "remark": "<optional note>"},
+                ...
+            ],
+            "pool": "super"   // default "super"
+        }
+    """
+    requested_pool = (req.pool or "super").strip().lower()
+    if requested_pool not in ("basic", "super", "heavy"):
+        raise ValidationError(f"Unknown pool: {req.pool!r}", param="pool")
+
+    # Deduplicate and sanitise
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in req.tokens:
+        tok = _sanitize(entry.token)
+        if not tok:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        items.append({"token": tok, "remark": (entry.remark or "").strip()})
+
+    if not items:
+        raise ValidationError("No valid tokens provided", param="tokens")
+
+    # Check which already exist (non-deleted)
+    new_tokens = [it["token"] for it in items]
+    try:
+        existing = await repo.get_accounts(new_tokens)
+    except Exception:
+        existing = []
+    existing_map = {r.token: r for r in existing if not r.is_deleted()}
+
+    upserts: list[AccountUpsert] = []
+    extras: list[dict] = []
+    for it in items:
+        tok = it["token"]
+        remark = it["remark"]
+        if tok in existing_map:
+            # Existing account — update remark only if:
+            #   1. new remark is non-empty (always apply), or
+            #   2. existing remark is empty (allow overwriting blank)
+            rec = existing_map[tok]
+            old_remark = (rec.ext or {}).get("remark", "")
+            if remark or not old_remark:
+                merged_ext = dict(rec.ext)
+                if remark:
+                    merged_ext["remark"] = remark
+                else:
+                    merged_ext.pop("remark", None)
+                extras.append({"token": tok, "ext_merge": merged_ext})
+        else:
+            # New account
+            upserts.append(AccountUpsert(
+                token=tok,
+                pool=requested_pool,
+                ext={"remark": remark} if remark else {},
+            ))
+
+    added_count = 0
+    updated_count = 0
+
+    if upserts:
+        result = await repo.upsert_accounts(upserts)
+        added_count = result.upserted
+
+    if extras:
+        patches = [AccountPatch(token=e["token"], ext_merge=e["ext_merge"]) for e in extras]
+        result = await repo.patch_accounts(patches)
+        updated_count = result.patched
+
+    all_imported = [u.token for u in upserts] + [e["token"] for e in extras]
+    if all_imported:
+        asyncio.create_task(_refresh_imported(refresh_svc, all_imported))
+
+    logger.info(
+        "admin tokens imported with remarks: pool={} added={} updated={}",
+        requested_pool,
+        added_count,
+        updated_count,
+    )
+    return _json({
+        "ok": True,
+        "pool": requested_pool,
+        "added": added_count,
+        "updated": updated_count,
+        "total": len(items),
+    })
 
 
 # ---------------------------------------------------------------------------

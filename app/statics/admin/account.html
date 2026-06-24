@@ -984,6 +984,7 @@
           <th class="table-center" data-i18n="account.colFail">失败</th>
           <th class="table-center" data-i18n="account.colRate">成功率</th>
           <th data-i18n="account.colLastUsed">最近使用</th>
+          <th style="width:140px" data-i18n="account.colRemark">备注</th>
           <th data-i18n="account.colActions">操作</th>
         </tr>
       </thead>
@@ -1051,6 +1052,10 @@
       <div class="dialog-field">
         <span class="dialog-label" data-i18n="account.labelType">类型</span>
         <select class="input" id="edit-pool" style="flex:1"></select>
+      </div>
+      <div class="dialog-field">
+        <span class="dialog-label" data-i18n="account.colRemark">备注</span>
+        <input class="input" id="edit-remark" placeholder="备注">
       </div>
     </div>
     <div class="dialog-actions">
@@ -1478,6 +1483,7 @@ function rowHtml(t) {
           <path d="M14.8 5.2 5.2 14.8"/>
         </svg>
       </button>`;
+  const remark = (t.remark || '').trim();
   return `<tr>
     <td><input type="checkbox" class="cb row-cb" data-token="${xe(t.token)}" ${sel.has(t.token)?'checked':''} onchange="toggleRow(this)"></td>
     <td><div class="token-stack">
@@ -1493,6 +1499,7 @@ function rowHtml(t) {
     <td class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fail}</td>
     <td class="table-center" style="font-variant-numeric:tabular-nums;color:#9a9a9a">${fmtRate(success, fail)}</td>
     <td style="font-size:12px;color:#9a9a9a">${fmtDate(t.last_used_at)}</td>
+    <td style="font-size:12px;color:#6a6459;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${xe(remark)}">${xe(remark) || '<span style="color:#ccc">—</span>'}</td>
     <td><div class="row-actions">
       ${nsfwBtn}
       <button onclick="${isDisabled ? `restoreOne('${xe(t.token)}')` : `disableOne('${xe(t.token)}')`}" class="row-icon-btn row-icon-btn-state" data-tip="${xe(isDisabled ? tr('account.actionRestore', null, '恢复账号') : tr('account.actionDisable', null, '禁用账号'))}" aria-label="${xe(isDisabled ? tr('account.actionRestore', null, '恢复账号') : tr('account.actionDisable', null, '禁用账号'))}">
@@ -1667,6 +1674,7 @@ function openEdit(token) {
   document.getElementById('edit-token').value = item.token;
   fillPoolOptions('edit-pool');
   document.getElementById('edit-pool').value = item.pool || 'basic';
+  document.getElementById('edit-remark').value = item.remark || '';
   openModal('modal-edit');
 }
 
@@ -1725,11 +1733,12 @@ async function doImport() {
 async function doEdit() {
   const token = document.getElementById('edit-token').value.trim();
   const pool = document.getElementById('edit-pool').value;
+  const remark = document.getElementById('edit-remark').value.trim();
   if (!_editingToken) return;
   if (!token) return showToast(tr('account.enterToken', null, '请输入 Token'), 'error');
   try {
     showToast(tr('account.saving', null, '正在保存修改…'), 'info');
-    await _api('PUT', '/tokens/edit', { old_token: _editingToken, token, pool });
+    await _api('PUT', '/tokens/edit', { old_token: _editingToken, token, pool, remark });
     closeModal('modal-edit');
     _editingToken = '';
     showToast(tr('account.editDone', null, '编辑完成'), 'success');

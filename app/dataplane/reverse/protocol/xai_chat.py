@@ -114,17 +114,62 @@ def classify_line(line: str | bytes) -> tuple[str, str]:
     return "skip", ""
 
 
+def _extract_inband_error(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Walk obj to find the first upstream in-band error dict.
+
+    Grok nests errors in multiple paths:
+      - top-level ``error`` (some older response shapes)
+      - ``result.response.error`` (queryAction-level stream errors)
+      - ``result.response.modelResponse.streamErrors[i]`` (per-stream error)
+    """
+    # top-level error
+    top = obj.get("error")
+    if isinstance(top, dict):
+        return top
+    # result.response.error
+    result = obj.get("result")
+    if isinstance(result, dict):
+        resp = result.get("response")
+        if isinstance(resp, dict):
+            resp_error = resp.get("error")
+            if isinstance(resp_error, dict):
+                return resp_error
+            # modelResponse.streamErrors
+            mr = resp.get("modelResponse")
+            if isinstance(mr, dict):
+                se_list = mr.get("streamErrors")
+                if isinstance(se_list, list) and se_list:
+                    for se in se_list:
+                        if isinstance(se, dict) and (se.get("message") or se.get("usagePoolExhausted") is not None):
+                            return se
+            # direct streamErrors on response
+            se_list = resp.get("streamErrors")
+            if isinstance(se_list, list) and se_list:
+                for se in se_list:
+                    if isinstance(se, dict) and (se.get("message") or se.get("usagePoolExhausted") is not None):
+                        return se
+    return None
+
+
 def stream_error_from_payload(obj: dict[str, Any]) -> UpstreamError | None:
     """Convert upstream in-band stream error payloads to retryable errors."""
-    error = obj.get("error")
-    if not isinstance(error, dict):
+    error = _extract_inband_error(obj)
+    if error is None:
         return None
 
     raw_message = error.get("message") or error.get("error") or "Upstream stream error"
     message = str(raw_message)
     code = error.get("code")
     text = message.lower()
-    status = 429 if code == 8 or "too many requests" in text or "rate limit" in text else 502
+    # usagePoolExhausted → quota drained, treat as rate-limited (429) so
+    # the token goes into the cooling pool and won't be picked again.
+    has_exhausted = error.get("usagePoolExhausted") is not None
+    if has_exhausted:
+        status = 429
+    elif code == 8 or "too many requests" in text or "rate limit" in text:
+        status = 429
+    else:
+        status = 502
 
     try:
         body = orjson.dumps(obj).decode()

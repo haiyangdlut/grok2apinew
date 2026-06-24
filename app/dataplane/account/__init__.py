@@ -261,12 +261,12 @@ class AccountDirectory:
                     fb.apply_success_quota(table, idx, mode_id)
 
             elif kind == FeedbackKind.RATE_LIMITED:
+                pool_id = int(table.pool_by_idx[idx])
+                cooling_sec = _pool_cooling_sec(pool_id)
                 if strategy == "random":
-                    pool_id = int(table.pool_by_idx[idx])
-                    cooling_sec = _pool_cooling_sec(pool_id)
                     fb.apply_rate_limited_random(table, idx, cooling_sec=cooling_sec)
                 else:
-                    fb.apply_rate_limited_quota(table, idx, mode_id)
+                    fb.apply_rate_limited_quota(table, idx, mode_id, cooling_sec=cooling_sec)
                 fb.update_last_fail(table, idx, ts)
 
             elif kind == FeedbackKind.UNAUTHORIZED:

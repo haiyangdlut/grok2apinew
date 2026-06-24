@@ -141,7 +141,7 @@ def _json(data) -> Response:
 
 @router.get("/tokens")
 async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
-    """Return flat token list."""
+    """Return flat token list with runtime health/cooling."""
     all_items: list = []
     page_num = 1
     while True:
@@ -151,7 +151,39 @@ async def list_tokens(repo: "AccountRepository" = Depends(get_repo)):
             break
         page_num += 1
 
-    return _json({"tokens": [_serialize_record(r) for r in all_items]})
+    # Enrich with runtime health + cooling from the in-memory directory
+    from app.dataplane.account import _directory
+    from app.platform.runtime.clock import now_s
+    rt_map: dict[str, tuple[float, int]] = {}
+    if _directory is not None and _directory._table is not None:
+        table = _directory._table
+        for idx in range(len(table.token_by_idx)):
+            token = table.token_by_idx[idx]
+            if token:
+                rt_map[token] = (
+                    round(float(table.health_by_idx[idx]), 2),
+                    int(table.cooling_until_s_by_idx[idx]),
+                )
+
+    ts = now_s()
+    enriched: list[dict] = []
+    for r in all_items:
+        rec = _serialize_record(r)
+        hc = rt_map.get(r.token)
+        if hc is not None:
+            health = hc[0]
+            cooling_until = hc[1]
+            rec["health"] = health
+            rec["cooling_until"] = cooling_until
+            # Override status based on runtime metrics so the management UI
+            # shows "cooling" for rate-limited accounts whose DB status is
+            # still "active" (StatusId must stay ACTIVE to keep the account
+            # in mode_available so window-reset recovery can still happen).
+            if rec["status"] == "active" and health < 1.0 and cooling_until > ts:
+                rec["status"] = "cooling"
+        enriched.append(rec)
+
+    return _json({"tokens": enriched})
 
 
 @router.post("/tokens")

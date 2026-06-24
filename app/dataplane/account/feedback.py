@@ -47,10 +47,14 @@ def apply_success_random(table: AccountRuntimeTable, idx: int) -> None:
 
 
 def apply_rate_limited_quota(
-    table: AccountRuntimeTable, idx: int, mode_id: int
+    table: AccountRuntimeTable, idx: int, mode_id: int, *, cooling_sec: int = 0
 ) -> None:
-    """Quota strategy: zero the mode quota and reduce health."""
+    """Quota strategy: zero the mode quota, set cooldown, and reduce health."""
     table._quota_col(mode_id)[idx] = 0
+    if cooling_sec > 0:
+        ts = now_s() + cooling_sec
+        cooling_col = table.cooling_until_s_by_idx
+        cooling_col[idx] = max(int(cooling_col[idx]), ts)
     _adjust_health(table, idx, _RATE_LIMIT_FACTOR)
 
 

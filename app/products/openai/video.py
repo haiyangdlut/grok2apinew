@@ -64,7 +64,7 @@ from app.products._account_selection import reserve_account, selection_max_retri
 
 _IMAGE_MEDIA_TYPE = "MEDIA_POST_TYPE_IMAGE"
 _VIDEO_MEDIA_TYPE = "MEDIA_POST_TYPE_VIDEO"
-_VIDEO_MODEL_NAME = "grok-imagine-video-1.5-preview"
+_VIDEO_MODEL_NAME = "imagine-video-gen"
 _VIDEO_QUALITY = "standard"
 _VIDEO_OBJECT = "video"
 _VIDEO_JOB_TTL_S = 3600
@@ -455,6 +455,11 @@ async def _stream_video_request(
     kwargs = build_session_kwargs(lease=lease)
 
     async with ResettableSession(**kwargs) as session:
+        logger.warning(
+            "video payload dump: model={} mode={} keys={}",
+            payload.get("modelName"), payload.get("modelMode"),
+            sorted(payload.keys()),
+        )
         response = await session.post(
             CHAT,
             headers=headers,
@@ -631,6 +636,7 @@ async def _collect_video_segment(
             obj = orjson.loads(data)
         except Exception:
             continue
+        # Report in-band stream errors from any nesting level
         raise_for_stream_error(obj)
 
         stream = _extract_streaming_video_response(obj)
@@ -659,6 +665,11 @@ async def _collect_video_segment(
                 thumbnail = stream.get("thumbnailImageUrl")
                 if isinstance(raw_url, str) and raw_url:
                     final_url = _absolutize_video_url(raw_url)
+                else:
+                    logger.warning(
+                        "video segment 100%% no videoUrl: stream_keys=%s moderated=%s",
+                        sorted(stream.keys()), stream.get("moderated"),
+                    )
                 if isinstance(asset_id, str) and asset_id:
                     final_asset_id = asset_id
                 if isinstance(thumbnail, str) and thumbnail:
@@ -678,6 +689,12 @@ async def _collect_video_segment(
             body="\n".join(stream_data_items),
         )
     if not final_url:
+        # Include the last SSE data item for diagnosis
+        last_data = stream_data_items[-1] if stream_data_items else "<no stream data>"
+        logger.error(
+            "video segment yielded no videoUrl: total_sse_lines={} last_data={}",
+            len(stream_data_items), last_data[:2000] if last_data else last_data,
+        )
         raise UpstreamError(
             "Video generation returned no final video URL",
             status=503,
